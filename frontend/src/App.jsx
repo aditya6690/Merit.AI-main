@@ -1,0 +1,163 @@
+import { Suspense, lazy, useEffect } from "react";
+import { Routes, Route, useLocation } from "react-router-dom";
+import { PAGE_META, setPageMeta } from "./lib/seo.js";
+import ErrorBoundary from "./components/ErrorBoundary.jsx";
+import RouteFallback from "./components/RouteFallback.jsx";
+
+// Eager: the entry points. Login and the 404 are small,
+// and Home is the first paint for most visitors.
+import Home from "./pages/Home.jsx";
+import Login from "./pages/Login.jsx";
+import Placeholder from "./pages/Placeholder.jsx";
+
+/**
+ * Route-level code splitting.
+ */
+
+// --- marketing -------------------------------------------------------------
+const ForgotPassword = lazy(() => import("./pages/ForgotPassword.jsx"));
+const Activate = lazy(() => import("./pages/Activate.jsx"));
+const Register = lazy(() => import("./pages/Register.jsx"));
+const RequestAccess = lazy(() => import("./pages/RequestAccess.jsx"));
+const ExaminerDashboard = lazy(() => import("./pages/ExaminerDashboard.jsx"));
+const ExaminerAttemptReport = lazy(() => import("./pages/examiner/AttemptReport.jsx"));
+const ExaminerInterviewList = lazy(() => import("./pages/examiner/InterviewListPage.jsx"));
+const ExaminerInterviewWorkspace = lazy(() => import('./pages/examiner/InterviewWorkspace.jsx'));
+const Privacy = lazy(() => import("./pages/Privacy.jsx"));
+const Terms = lazy(() => import("./pages/Terms.jsx"));
+const SystemCheck = lazy(() => import("./pages/SystemCheck.jsx"));
+const Features = lazy(() => import("./pages/Features.jsx"));
+const Pricing = lazy(() => import("./pages/Pricing.jsx"));
+const About = lazy(() => import("./pages/About.jsx"));
+const FAQ = lazy(() => import("./pages/FAQ.jsx"));
+const Contact = lazy(() => import("./pages/Contact.jsx"));
+
+// --- signed-in, all roles --------------------------------------------------
+const Dashboard = lazy(() => import("./pages/Dashboard.jsx"));
+const Profile = lazy(() => import("./pages/Profile.jsx"));
+const Results = lazy(() => import("./pages/Results.jsx"));
+const InterviewWorkspace = lazy(() => import("./pages/InterviewWorkspace.jsx"));
+
+// --- the exam runner -------------------------------------------------------
+// The single biggest page in the app, and the one whose dependencies
+// (CodeMirror, the proctoring stack) are heaviest.
+const Exam = lazy(() => import("./pages/Exam.jsx"));
+
+// --- admin drill-down ------------------------------------------------------
+const AdminExaminers = lazy(() => import("./pages/AdminExaminers.jsx"));
+const AdminExaminerDetail = lazy(() => import("./pages/AdminExaminerDetail.jsx"));
+const AdminExams = lazy(() => import("./pages/AdminExams.jsx"));
+const AdminExamDetail = lazy(() => import("./pages/AdminExamDetail.jsx"));
+const AdminCandidates = lazy(() => import("./pages/AdminCandidates.jsx"));
+const AdminCandidateDetail = lazy(() => import("./pages/AdminCandidateDetail.jsx"));
+const AdminAttemptReport = lazy(() => import("./pages/AdminAttemptReport.jsx"));
+const AdminLiveSessions = lazy(() => import("./pages/AdminLiveSessions.jsx"));
+const AdminReviewQueue = lazy(() => import("./pages/AdminReviewQueue.jsx"));
+const AdminOrganizations = lazy(() => import("./pages/AdminOrganizations.jsx"));
+
+/**
+ * Sets the page's metadata whenever the route changes.
+ */
+function RouteMeta() {
+  const { pathname } = useLocation();
+  useEffect(() => {
+    const meta = PAGE_META[pathname];
+    if (meta) {
+      setPageMeta({ ...meta, path: pathname });
+    } else {
+      setPageMeta({
+        title: "Merit.Ai",
+        description: "AI-proctored online examinations.",
+        path: pathname,
+        noindex: true,
+      });
+    }
+  }, [pathname]);
+  return null;
+}
+
+export default function App() {
+  return (
+    // The boundary wraps the router rather than sitting inside
+    // it, so it also catches a chunk that fails to load.
+    <ErrorBoundary>
+      <RouteMeta />
+      <Suspense fallback={<RouteFallback />}>
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/login" element={<Login />} />
+          <Route path="/forgot-password" element={<ForgotPassword />} />
+          {/* Where an activation link lands. No login: the token in the URL is
+              the credential, and the whole point is that the account has no
+              password yet for anyone to sign in with. */}
+          <Route path="/activate" element={<Activate />} />
+          <Route path="/register" element={<Register />} />
+          {/* Examiners can't self-register -- this collects a request an admin
+              reviews, and is where the marketing site's examiner CTA points. */}
+          <Route path="/request-access" element={<RequestAccess />} />
+          <Route path="/privacy" element={<Privacy />} />
+          {/* The consent checkbox said "Terms of Service" and linked to /privacy,
+              which opens by stating it is not one. */}
+          <Route path="/terms" element={<Terms />} />
+          {/* No login: a candidate needs to test their device BEFORE exam day,
+              which is precisely when they may not yet have an account. */}
+          <Route path="/system-check" element={<SystemCheck />} />
+
+          {/* Marketing pages linked from the nav -- each a full page rather than
+              an anchor scroll, so they're directly linkable/bookmarkable. */}
+          <Route path="/features" element={<Features />} />
+          <Route path="/pricing" element={<Pricing />} />
+          <Route path="/about" element={<About />} />
+          <Route path="/faq" element={<FAQ />} />
+          <Route path="/contact" element={<Contact />} />
+          <Route path="/dashboard" element={<Dashboard />} />
+          {/* The examiner portal is routed rather than tab-state inside one
+              component, so refresh and browser Back behave and every view has a
+              URL an examiner can bookmark or share. */}
+          <Route path="/examiner" element={<ExaminerDashboard />} />
+          <Route path="/examiner/exams/:examId" element={<ExaminerDashboard />} />
+          <Route path="/examiner/interviews/:interviewId" element={<ExaminerInterviewWorkspace />} />
+         <Route path="/examiner/interviews" element={<ExaminerInterviewList />} />
+          {/* Every violation an examiner can see, for one candidate at a
+              time -- see AttemptReport.jsx. There is no examiner-facing
+              cross-exam violations list; reviewing conduct is inherently a
+              per-candidate judgement. */}
+          <Route path="/examiner/attempts/:attemptId" element={<ExaminerAttemptReport />} />
+          <Route path="/profile" element={<Profile />} />
+          <Route path="/exam/:examId" element={<Exam />} />
+          <Route path="/interview/:interviewId" element={<InterviewWorkspace />} />
+          <Route path="/results/:attemptId" element={<Results />} />
+
+          {/* Admin dashboard drill-down pages -- each guarded admin-only inline
+              (mirroring the isLoggedIn/getRole guard idiom used elsewhere, e.g.
+              Profile.jsx), rather than a wrapping layout route, since that's the
+              existing pattern for role-gated pages in this app. */}
+          <Route path="/admin/examiners" element={<AdminExaminers />} />
+          <Route path="/admin/examiners/:examinerId" element={<AdminExaminerDetail />} />
+          <Route path="/admin/exams" element={<AdminExams />} />
+          <Route path="/admin/exams/:examId" element={<AdminExamDetail />} />
+          <Route path="/admin/candidates" element={<AdminCandidates />} />
+          <Route path="/admin/candidates/:studentId" element={<AdminCandidateDetail />} />
+          <Route path="/admin/attempts/:attemptId" element={<AdminAttemptReport />} />
+          <Route path="/admin/live-sessions" element={<AdminLiveSessions />} />
+          {/* No standalone "every violation across every exam" page anymore --
+              an admin reviewing violations goes exam -> student, the same as
+              an examiner does (see AdminExamDetail.jsx's "View Report" link
+              into AdminAttemptReport.jsx, which already shows every
+              violation for that one candidate). The review queue below is a
+              distinct triage worklist for undecided flags, not a browsing
+              list, and stays. */}
+          {/* The reviewer's worklist, and the tenancy boundary every access
+              decision runs through -- neither had a page. */}
+          <Route path="/admin/review-queue" element={<AdminReviewQueue />} />
+          <Route path="/admin/organizations" element={<AdminOrganizations />} />
+
+          <Route path="*" element={<Placeholder title="Page not found" description="That page doesn't exist yet." />} />
+        </Routes>
+      </Suspense>
+    </ErrorBoundary>
+  );
+}
+
+
+

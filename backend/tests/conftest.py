@@ -1,0 +1,151 @@
+"""Pytest configuration for the backend test suite."""
+import os
+import tempfile
+
+# These must be set before any `app.*` module is imported, since Settings is
+# resolved (and lru_cache'd) at first import.
+os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+os.environ.setdefault("SECRET_KEY", "test-secret-key-not-for-production")
+os.environ.setdefault("CORS_ORIGINS", "http://testserver")
+os.environ.setdefault("AI_SERVICE_URL", "")
+os.environ.setdefault("UPLOAD_DIR", tempfile.mkdtemp(prefix="exam_proctor_test_uploads_"))
+# The suite has no SMTP, so it IS the "cannot send email" deployment this setting exists for.
+os.environ.setdefault("REQUIRE_EMAIL_VERIFICATION", "false")
+# Same reasoning: the suite's ~30 registrations exist to set up other tests, and threading two
+# consent booleans through every one of them would obscure what each is actually about.
+os.environ.setdefault("REQUIRE_CONSENT_ON_SIGNUP", "false")
+
+import fakeredis
+import pytest
+from fastapi.testclient import TestClient
+from passlib.context import CryptContext
+
+import app.models  # noqa: F401  registers every mapped model on Base.metadata
+from app.core import queues as _queues
+from app.core import redis_client as _redis_client
+from app.core import security as _security
+from app.core.rate_limit import _reset_all as _reset_rate_limit_counters
+
+# Drop bcrypt's work factor to the minimum for tests
+# only. bcrypt's cost is deliberately punishing.
+_security.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=4)
+
+from app.core.security import hash_password  # noqa: E402  must follow the cost override above
+from app.database.session import Base, SessionLocal, engine, get_db
+from app.main import app as fastapi_app
+from app.models.enums import RoleName
+from app.models.user import Role, User
+
+
+@pytest.fixture(autouse=True)
+def _fresh_database():
+    """Rebuild the schema before every test so state never leaks between tests."""
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture(autouse=True)
+def _fake_redis():
+    """Every Redis-backed module -- rate limiting, OTP state, distributed locks, the RQ queues
+    (see app/core/rate_limit.py, app/services/otp_redis_store.py, app/core/locks.py,
+    app/core/queues.py) -- talks to an in-memory fake for the life of one test, the same
+    reasoning an in-memory SQLite database exists for Postgres above.
+    """
+    fake_server = fakeredis.FakeServer()
+    decoded = fakeredis.FakeStrictRedis(server=fake_server, decode_responses=True)
+    raw = fakeredis.FakeStrictRedis(server=fake_server, decode_responses=False)
+    _redis_client.set_client_for_tests(decoded, raw_client=raw)
+    _queues.set_eager_for_tests(True)
+    yield decoded
+    _redis_client.reset_for_tests()
+    _queues.set_eager_for_tests(False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits(_fake_redis):
+    """Starlette's TestClient sends every request from the same fake source
+    IP for the life of the pytest process, so the per-IP counters in
+    app/core/rate_limit.py would otherwise accumulate across unrelated test
+    functions and start rejecting their login/register calls with spurious
+    429s. Reset before every test, same rationale as _fresh_database above."""
+    _reset_rate_limit_counters()
+    yield
+
+
+@pytest.fixture
+def db_session():
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture
+def client():
+    def _override_get_db():
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    fastapi_app.dependency_overrides[get_db] = _override_get_db
+    with TestClient(fastapi_app) as test_client:
+        yield test_client
+    fastapi_app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def seed_roles(db_session):
+    for role_name in (RoleName.ADMIN.value, RoleName.EXAMINER.value, RoleName.STUDENT.value):
+        if not db_session.query(Role).filter(Role.name == role_name).first():
+            db_session.add(Role(name=role_name))
+    db_session.commit()
+
+
+@pytest.fixture
+def admin_token(client, seed_roles, db_session):
+    admin_role = db_session.query(Role).filter(Role.name == RoleName.ADMIN.value).first()
+    admin = User(
+        email="admin@example.com",
+        hashed_password=hash_password("Admin@12345"),
+        role_id=admin_role.id,
+    )
+    admin.set_name("Test", "Admin")
+    db_session.add(admin)
+    db_session.commit()
+
+    response = client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "Admin@12345"})
+    assert response.status_code == 200, response.text
+    return response.json()["access_token"]
+
+
+def auth_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def outbox(monkeypatch):
+    """Every message the app tried to send, in order, with one shape."""
+    from app.services import email_service
+
+    sent = []
+
+    def _record(*, to, subject, text_body, html_body=None):
+        sent.append({"to": to, "subject": subject, "text": text_body, "html": html_body})
+        return True
+
+    monkeypatch.setattr(email_service, "send", _record)
+    monkeypatch.setattr(email_service, "queue", lambda background, **kw: _record(**kw) and None)
+    return sent
+
+
+@pytest.fixture
+def email_on(monkeypatch):
+    """Pretend this deployment has working SMTP configured."""
+    from app.services import email_service
+
+    monkeypatch.setattr(email_service, "is_enabled", lambda: True)

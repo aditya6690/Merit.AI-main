@@ -1,0 +1,36 @@
+# Line-ending policy. Windows checkouts default to core.autocrlf=true, which rewrites LF
+# to CRLF; the rules below state what each file type must be regardless of platform.
+
+# Sensible default -- normalise text in the repo, let git pick the working-tree
+# form per platform for everything not listed explicitly below.
+* text=auto
+
+# Must be LF in the working tree, on every platform, always.
+*.sh            text eol=lf
+entrypoint.sh   text eol=lf
+Dockerfile      text eol=lf
+*.conf          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+.env.example    text eol=lf
+
+# Python and web sources: LF everywhere keeps diffs clean between the Windows
+# dev machine and the Linux containers/CI that also read them.
+*.py            text eol=lf
+*.js            text eol=lf
+*.jsx           text eol=lf
+*.css           text eol=lf
+*.html          text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+*.ini           text eol=lf
+*.mako          text eol=lf
+
+# Binary -- never touch, never diff as text.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.ico           binary
+*.onnx          binary
+*.pt            binary
+*.pdf           binary

@@ -1,0 +1,35 @@
+# Same intent as .gitignore, scoped to what the Core API image build never needs to see.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.env
+.env.*
+!.env.example
+
+# Downloaded AI model weights -- these belong in the named volume mounted at
+# /app/models, never baked into the image layer (multi-hundred-MB layers that
+# never change would defeat image layer caching for every other change).
+models/
+*.onnx
+*.pt
+
+uploads/
+*.log
+*.pid
+
+*.db
+*.sqlite
+*.sqlite3
+
+.git/
+.gitignore
+README.md
+
+# NOTE: ai_worker/ is intentionally NOT excluded here.

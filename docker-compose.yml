@@ -1,0 +1,380 @@
+# Merit.Ai -- full stack: reverse proxy, SPA, API, AI worker, scheduler, RQ worker,
+# PostgreSQL and Redis. See docs/ARCHITECTURE.md for the service and network map.
+#
+#   cp .env.example .env      # set SECRET_KEY, POSTGRES_PASSWORD, REDIS_PASSWORD
+#   docker compose up --build
+#   open http://localhost
+
+services:
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-merit_ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-merit_ai}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-merit_ai} -d ${POSTGRES_DB:-merit_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - data-net
+    # Not published to the host: core-api reaches it over the internal `data-net`
+    # network. Uncomment for a host-side DB client, changing the port if 5432 is taken.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # --appendonly yes: survive a restart with in-flight OTP cooldowns and queued jobs
+    # intact. --requirepass: no anonymous access even on the internal-only network.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    networks:
+      - cache-net
+    deploy:
+      resources:
+        limits:
+          # Everything stored here is small (counters, short-lived hashes, queued job payloads)
+          # and TTL-bounded or consumed quickly.
+          memory: 256m
+    # Not published to the host, and reachable only over cache-net.
+    # ports:
+    #   - "127.0.0.1:6379:6379"   # uncomment only for local debugging
+
+  # ----------------------------------------------------------------------------
+  ai-worker:
+    build:
+      context: ./backend
+      dockerfile: ai_worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Deliberately NOT AI_SERVICE_URL -- leaving it unset is what makes this process's own
+      # app.ai.face_service / object_service calls take their "local" branch, i.e. actually run
+      # inference here rather than trying to call itself.
+      FACE_MODEL_NAME: ${FACE_MODEL_NAME:-buffalo_l}
+      FACE_MODEL_ROOT: /app/models/insightface
+      OBJECT_MODEL_ROOT: /app/models/yolo
+      ANTISPOOF_MODEL_ROOT: /app/models/antispoof
+      # This process never issues or checks a JWT and never opens a database connection, so it
+      # has no real secret to protect.
+      ENVIRONMENT: development
+    volumes:
+      - ai_models:/app/models
+    networks:
+      - ai-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as r; r.urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    deploy:
+      resources:
+        limits:
+          # Inference-heavy but single-purpose; caps this container's own
+          # blast radius on a host also running core-api and Postgres.
+          memory: 2g
+
+  # ----------------------------------------------------------------------------
+  core-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-merit_ai}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-merit_ai}
+      SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY in .env -- generate one with python3 -c 'import secrets; print(secrets.token_urlsafe(64))'}"
+      # Rate limiting, OTP state and distributed locks -- see backend/app/core/redis_client.py.
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+      LOCK_DEFAULT_TTL_SECONDS: ${LOCK_DEFAULT_TTL_SECONDS:-30}
+      JOB_MAX_RETRIES: ${JOB_MAX_RETRIES:-3}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-300}
+      # Redis-backed, shared across every core-api worker and replica -- see
+      # app/core/rate_limit.py.
+      AUTH_RATE_LIMIT_MAX_REQUESTS: ${AUTH_RATE_LIMIT_MAX_REQUESTS:-10}
+      AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
+      AI_RATE_LIMIT_MAX_REQUESTS: ${AI_RATE_LIMIT_MAX_REQUESTS:-30}
+      AI_RATE_LIMIT_WINDOW_SECONDS: ${AI_RATE_LIMIT_WINDOW_SECONDS:-60}
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-120}
+      UPLOAD_DIR: /app/uploads
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+      # Points at the dedicated inference service instead of this container's own
+      # (still-installed, still-functional) local fallback.
+      AI_SERVICE_URL: http://ai-worker:8010
+      AI_SERVICE_TIMEOUT_SECONDS: ${AI_SERVICE_TIMEOUT_SECONDS:-8}
+      FACE_MATCH_TOLERANCE: ${FACE_MATCH_TOLERANCE:-0.38}
+      FACE_MODEL_NAME: ${FACE_MODEL_NAME:-buffalo_l}
+      FACE_MODEL_ROOT: /app/models/insightface
+      OBJECT_MODEL_ROOT: /app/models/yolo
+      ANTISPOOF_MODEL_ROOT: /app/models/antispoof
+      LOCKDOWN_STRIKE_LIMIT: ${LOCKDOWN_STRIKE_LIMIT:-3}
+      CODE_EXECUTION_ENABLED: ${CODE_EXECUTION_ENABLED:-true}
+      CODE_EXECUTION_MAX_CONCURRENT: ${CODE_EXECUTION_MAX_CONCURRENT:-4}
+      # uvicorn worker processes. Rule of thumb: (2 x cores) + 1, capped by the database --
+      # total Postgres connections are (DB_POOL_SIZE + DB_MAX_OVERFLOW) x this value.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      # Defaults to true so an existing deployment keeps booting correctly.
+      RUN_MIGRATIONS_ON_START: ${RUN_MIGRATIONS_ON_START:-true}
+      FACE_MATCHING_ENABLED: ${FACE_MATCHING_ENABLED:-true}
+      OBJECT_DETECTION_ENABLED: ${OBJECT_DETECTION_ENABLED:-true}
+      POSE_DETECTION_ENABLED: ${POSE_DETECTION_ENABLED:-true}
+      AUTO_SEED_ADMIN: ${AUTO_SEED_ADMIN:-true}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@merit.ai}
+      # Intentionally has NO default. Unset in production means "create no
+      # admin", which is the safe outcome -- see backend/app/utils/seed.py.
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
+      # Outbound email.
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Merit.Ai}
+      ADMIN_NOTIFICATION_EMAIL: ${ADMIN_NOTIFICATION_EMAIL:-}
+      # Defaults to the first configured CORS origin: in the bundled
+      # single-origin setup the address a browser loads the app from is exactly
+      # the address an email link should point at.
+      APP_BASE_URL: ${APP_BASE_URL:-${CORS_ORIGINS:-http://localhost}}
+      BIOMETRIC_CONSENT_VERSION: ${BIOMETRIC_CONSENT_VERSION:-2026-08-04.v1}
+      # 0 = never auto-delete. Deliberate default -- see .env.example.
+      BIOMETRIC_RETENTION_DAYS: ${BIOMETRIC_RETENTION_DAYS:-0}
+      BIOMETRIC_PURGE_INTERVAL_HOURS: ${BIOMETRIC_PURGE_INTERVAL_HOURS:-24}
+      # Fail-closed signup gates. Every variable is listed explicitly rather than via
+      # env_file, so anything added to .env must also be added here to reach the container.
+      REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-true}
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-10}
+      # Which hops may set X-Forwarded-For.
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.1/32}
+      REQUIRE_CONSENT_ON_SIGNUP: ${REQUIRE_CONSENT_ON_SIGNUP:-true}
+      OTP_LENGTH: ${OTP_LENGTH:-6}
+      OTP_TTL_MINUTES: ${OTP_TTL_MINUTES:-10}
+      OTP_MAX_ATTEMPTS: ${OTP_MAX_ATTEMPTS:-5}
+      OTP_RESEND_COOLDOWN_SECONDS: ${OTP_RESEND_COOLDOWN_SECONDS:-60}
+      # Activation links.
+      ACTIVATION_TTL_HOURS: ${ACTIVATION_TTL_HOURS:-72}
+      # "open" (anyone may register) or "invite" (only
+      # addresses already on an exam or organization roster).
+      REGISTRATION_MODE: ${REGISTRATION_MODE:-open}
+      # Examiner/admin sign-ins get an email; candidate sign-ins do not.
+      NOTIFY_STAFF_ON_LOGIN: ${NOTIFY_STAFF_ON_LOGIN:-true}
+      # Minimum gap between two admin notifications about the same pending access request.
+      ACCESS_REQUEST_RENOTIFY_SECONDS: ${ACCESS_REQUEST_RENOTIFY_SECONDS:-900}
+      EXAM_REMINDER_ENABLED: ${EXAM_REMINDER_ENABLED:-true}
+      EXAM_REMINDER_MINUTES_BEFORE: ${EXAM_REMINDER_MINUTES_BEFORE:-5}
+      EXAM_REMINDER_POLL_SECONDS: ${EXAM_REMINDER_POLL_SECONDS:-60}
+      # Permanent delivery record for tracked transactional email (admin notification,
+      # activation link, OTP codes, exam/report notices).
+      EMAIL_OUTBOX_MAX_ATTEMPTS: ${EMAIL_OUTBOX_MAX_ATTEMPTS:-5}
+      EMAIL_OUTBOX_RETRY_BASE_SECONDS: ${EMAIL_OUTBOX_RETRY_BASE_SECONDS:-60}
+      EMAIL_OUTBOX_RETRY_MAX_SECONDS: ${EMAIL_OUTBOX_RETRY_MAX_SECONDS:-3600}
+    volumes:
+      - uploads:/app/uploads
+      - core_models:/app/models
+      # Docker-outside-of-Docker: code_runner_service.py shells out to the `docker` CLI
+      # (installed in backend/Dockerfile) to run each coding-question test case in its own
+      # ephemeral, network-disabled container on the HOST's Docker daemon -- there is no nested
+      # daemon here, this container just talks to the same one your shell does.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The docker.sock above is owned by the *host's* docker group, whose GID varies by machine.
+    group_add:
+      - "0"
+    networks:
+      - data-net
+      - cache-net
+      - ai-net
+      - api-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai-worker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # NOT published to the host. The reverse proxy is the one
+    # and only door in, which is the whole point of having it.
+    expose:
+      - "8000"
+
+  # ----------------------------------------------------------------------------
+  scheduler:
+    # Periodic work: exam reminders, OTP purge, biometric retention. MUST stay at one replica.
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.scheduler.main"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-merit_ai}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-merit_ai}
+      SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY in .env}"
+      UPLOAD_DIR: /app/uploads
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost}
+      # A scheduler with one job at a time needs a pool of one. The default of
+      # 5+10 would hold 15 idle Postgres connections doing nothing.
+      DB_POOL_SIZE: 1
+      DB_MAX_OVERFLOW: 2
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Merit.Ai}
+      EXAM_REMINDER_ENABLED: ${EXAM_REMINDER_ENABLED:-true}
+      EXAM_REMINDER_MINUTES_BEFORE: ${EXAM_REMINDER_MINUTES_BEFORE:-5}
+      EXAM_REMINDER_POLL_SECONDS: ${EXAM_REMINDER_POLL_SECONDS:-60}
+      BIOMETRIC_RETENTION_DAYS: ${BIOMETRIC_RETENTION_DAYS:-0}
+      BIOMETRIC_PURGE_INTERVAL_HOURS: ${BIOMETRIC_PURGE_INTERVAL_HOURS:-24}
+      # Each periodic pass takes a Redis lock naming itself before running (see
+      # backend/app/scheduler/main.py).
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+      LOCK_DEFAULT_TTL_SECONDS: ${LOCK_DEFAULT_TTL_SECONDS:-30}
+      # This process never serves a request, so it must never
+      # run migrations either -- core-api owns the schema.
+      RUN_MIGRATIONS_ON_START: "false"
+      AUTO_SEED_ADMIN: "false"
+    volumes:
+      - uploads:/app/uploads
+    networks:
+      - data-net
+      - cache-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+
+  # ----------------------------------------------------------------------------
+  worker:
+    # An RQ worker consuming the emails/reports/default queues over Redis: transactional email
+    # delivery + retry, PDF result reports, bulk email.
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker.main"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-merit_ai}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-merit_ai}
+      SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY in .env}"
+      UPLOAD_DIR: /app/uploads
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost}
+      DB_POOL_SIZE: ${WORKER_DB_POOL_SIZE:-2}
+      DB_MAX_OVERFLOW: ${WORKER_DB_MAX_OVERFLOW:-3}
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Merit.Ai}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+      LOCK_DEFAULT_TTL_SECONDS: ${LOCK_DEFAULT_TTL_SECONDS:-30}
+      JOB_MAX_RETRIES: ${JOB_MAX_RETRIES:-3}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-300}
+      EMAIL_OUTBOX_MAX_ATTEMPTS: ${EMAIL_OUTBOX_MAX_ATTEMPTS:-5}
+      EMAIL_OUTBOX_RETRY_BASE_SECONDS: ${EMAIL_OUTBOX_RETRY_BASE_SECONDS:-60}
+      EMAIL_OUTBOX_RETRY_MAX_SECONDS: ${EMAIL_OUTBOX_RETRY_MAX_SECONDS:-3600}
+      RUN_MIGRATIONS_ON_START: "false"
+      AUTO_SEED_ADMIN: "false"
+    volumes:
+      - uploads:/app/uploads
+    networks:
+      - data-net
+      - cache-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: ${JOB_WORKER_REPLICAS:-1}
+
+  # ----------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    networks:
+      - web-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # No ports published -- reachable only through `proxy`. The whole point
+    # of the reverse proxy is that this is the one and only door in.
+
+  # ----------------------------------------------------------------------------
+  proxy:
+    build:
+      context: ./deploy/nginx
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:8080"
+      # - "${HTTPS_PORT:-443}:8443"   # see deploy/nginx/nginx.conf's TLS block
+    depends_on:
+      - core-api
+      - frontend
+    networks:
+      - api-net
+      - web-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  data-net:
+  cache-net:
+  ai-net:
+  api-net:
+  web-net:
+
+volumes:
+  pgdata:
+  redis_data:
+  uploads:
+  core_models:
+  ai_models:

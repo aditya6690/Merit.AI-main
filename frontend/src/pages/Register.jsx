@@ -1,0 +1,414 @@
+import { useEffect, useState, useRef } from "react";
+import { Link, Navigate, useNavigate } from "react-router-dom";
+import AuthLayout from "../components/AuthLayout.jsx";
+import { TextField, PasswordField } from "../components/FormField.jsx";
+import Icon from "../components/Icon.jsx";
+import { btnPrimary } from "../lib/ui.js";
+import { Api, ApiError } from "../lib/api.js";
+import { setSession, isLoggedIn } from "../lib/auth.js";
+import { TERMS_VERSION } from "./Terms.jsx";
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export default function Register() {
+  const navigate = useNavigate();
+  const [form, setForm] = useState({
+    firstName: "", lastName: "", email: "", studentId: "", password: "", confirmPassword: "",
+    agreeTerms: false, agreeProctoring: false,
+  });
+  const [errors, setErrors] = useState({});
+  // Only a field the person has actually left (or tried to submit through)
+  // shows its error -- see the identical comment in Login.jsx for why.
+  const [touched, setTouched] = useState({});
+  const [formError, setFormError] = useState("");
+  // Focus moves to the error when one appears. Without it a screen-reader user submits, hears
+  // nothing, and is left at the bottom of a form with no indication that anything happened.
+  const errorRef = useRef(null);
+  const [loading, setLoading] = useState(false);
+
+  // Email verification. Signup is two phases now:
+  // request a code, then create the account with it.
+  const [codeSent, setCodeSent] = useState(false);
+  const [code, setCode] = useState("");
+
+  // Everything about the code comes from the server's
+  // own response rather than being guessed here.
+  const [codeShape, setCodeShape] = useState({ length: 6, expiresIn: 10, resendAfter: 60 });
+  const [cooldown, setCooldown] = useState(0);
+
+  // The rules the SERVER enforces.
+  const [policy, setPolicy] = useState(null);
+
+  useEffect(() => {
+    if (cooldown <= 0) return undefined;
+    const timer = setTimeout(() => setCooldown((s) => s - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [cooldown]);
+
+  useEffect(() => {
+    let cancelled = false;
+    Api.get("/auth/password-policy")
+      .then((res) => { if (!cancelled) setPolicy(res); })
+      .catch(() => { /* the server still enforces it; this only affects the hint */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Signup is now a single step, so an already-signed-in visitor is simply sent onward.
+
+  function computeErrors(values) {
+    const next = {};
+    // Name is validated a little more strictly than a generic text field
+    // because it is matched against the student's ID card during
+    // verification, and becomes immutable once that match succeeds.
+    if (!values.firstName.trim()) next.firstName = "First name is required.";
+    if (!values.lastName.trim()) next.lastName = "Last name is required.";
+    if (!values.email.trim()) next.email = "Email is required.";
+    else if (!EMAIL_RE.test(values.email.trim())) next.email = "Enter a valid email address.";
+    else if (values.email.trim().length > 150) next.email = "That email address is too long.";
+    // Mirrors the server's floor rather than a number picked here.
+    const minLength = policy?.min_length ?? 10;
+    if (values.password.length < minLength) next.password = `Use at least ${minLength} characters.`;
+    if (values.confirmPassword !== values.password) next.confirmPassword = "Passwords don't match.";
+    return next;
+  }
+
+  function update(field) {
+    return (e) => {
+      const value = e.target.value;
+      const nextForm = { ...form, [field]: value };
+      setForm(nextForm);
+      // Typing in "password" can also fix/break "confirm password"'s error,
+      // so re-check both together whenever either has been touched already.
+      if (touched[field] || (field === "password" && touched.confirmPassword)) {
+        setErrors(computeErrors(nextForm));
+      }
+    };
+  }
+
+  function handleBlur(field) {
+    return () => {
+      setTouched((t) => ({ ...t, [field]: true }));
+      setErrors(computeErrors(form));
+    };
+  }
+
+  function describeError(err) {
+    if (err instanceof ApiError) {
+      if (err.status === 0) return "Network error — check your connection and try again.";
+      return err.message;
+    }
+    return "Something went wrong. Please try again.";
+  }
+
+  useEffect(() => {
+    if (formError) errorRef.current?.focus();
+  }, [formError]);
+
+  if (isLoggedIn()) return <Navigate to="/dashboard" replace />;
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setFormError("");
+    setTouched({ firstName: true, lastName: true, email: true, password: true, confirmPassword: true });
+    const next = computeErrors(form);
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+    if (!form.agreeTerms || !form.agreeProctoring) {
+      setFormError("Please agree to both statements below to create your account.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // Phase 1: ask for a code, if we haven't already.
+      if (!codeSent) {
+        const res = await Api.post("/auth/otp/signup/request", { email: form.email.trim() });
+        setCodeShape({
+          length: res.code_length ?? 6,
+          expiresIn: res.expires_in_minutes ?? 10,
+          resendAfter: res.resend_after_seconds ?? 60,
+        });
+        setCooldown(res.resend_after_seconds ?? 60);
+        setCodeSent(true);
+        return;
+      }
+
+      if (code.trim().length !== codeShape.length) {
+        setErrors((prev) => ({ ...prev, code: `Enter the ${codeShape.length}-digit code we emailed you.` }));
+        setTouched((t) => ({ ...t, code: true }));
+        return;
+      }
+
+      // Phase 2: create the account. The verified endpoint checks the code first, so a wrong
+      // code never leaves a half-made account behind.
+      const payload = {
+        first_name: form.firstName.trim(),
+        last_name: form.lastName.trim(),
+        email: form.email.trim(),
+        password: form.password,
+        roll_number: form.studentId.trim() || null,
+        // Sent, not merely checked in the browser.
+        accepted_terms: form.agreeTerms,
+        accepted_proctoring: form.agreeProctoring,
+        terms_version: TERMS_VERSION,
+      };
+      const data = await Api.post("/auth/register/student/verified", { ...payload, code: code.trim() });
+      setSession(data);
+      // Straight to the dashboard.
+      navigate("/dashboard", { replace: true });
+    } catch (err) {
+      setFormError(describeError(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function resendCode() {
+    setFormError("");
+    try {
+      const res = await Api.post("/auth/otp/signup/request", { email: form.email.trim() });
+      setCodeShape({
+        length: res.code_length ?? codeShape.length,
+        expiresIn: res.expires_in_minutes ?? codeShape.expiresIn,
+        resendAfter: res.resend_after_seconds ?? codeShape.resendAfter,
+      });
+      setCooldown(res.resend_after_seconds ?? codeShape.resendAfter);
+      setCode("");
+    } catch (err) {
+      setFormError(describeError(err));
+    }
+  }
+
+  /** Back to the email step, discarding everything tied to the old address. */
+  function changeEmail() {
+    // A code is bound to ONE address.
+    setCodeSent(false);
+    setCode("");
+    setCooldown(0);
+    setFormError("");
+    setErrors((prev) => ({ ...prev, code: undefined }));
+  }
+
+  return (
+    <AuthLayout
+      variant="register"
+      eyebrow="Get started"
+      title="Create your student account"
+      subtitle="Free to join — start taking proctored exams in minutes."
+      footer={
+        <>
+          Already have an account?{" "}
+          <Link to="/login" className="font-semibold text-primary hover:underline">
+            Log in
+          </Link>
+        </>
+      }
+    >
+
+      {formError && (
+        <div
+          ref={errorRef}
+          tabIndex={-1}
+          role="alert"
+          aria-live="assertive"
+          className="mb-5 flex items-start gap-2.5 rounded-xl border border-danger/30 bg-danger/5 px-4 py-3 text-sm text-danger animate-fade-in outline-none"
+        >
+          <Icon name="alert" width={16} height={16} className="mt-0.5 shrink-0" />
+          <span>{formError}</span>
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit} noValidate>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
+          <TextField
+            id="firstName"
+            label="First name"
+            icon="user"
+            autoComplete="given-name"
+            autoFocus
+            placeholder="Jane"
+            value={form.firstName}
+            onChange={update("firstName")}
+            onBlur={handleBlur("firstName")}
+            error={touched.firstName ? errors.firstName : undefined}
+            valid={touched.firstName && !errors.firstName && form.firstName.trim() !== ""}
+          />
+          <TextField
+            id="lastName"
+            label="Last name"
+            icon="user"
+            autoComplete="family-name"
+            placeholder="Doe"
+            value={form.lastName}
+            onChange={update("lastName")}
+            onBlur={handleBlur("lastName")}
+            error={touched.lastName ? errors.lastName : undefined}
+            valid={touched.lastName && !errors.lastName && form.lastName.trim() !== ""}
+          />
+        </div>
+        {/* Shortened from a two-sentence paragraph -- the full rationale
+            (why it's strict, what "locked" means) now lives in the info
+            icon's tooltip for anyone who wants it, instead of being forced
+            on everyone as a permanent block of text under the name fields. */}
+        <p className="-mt-1 mb-4 text-xs text-muted leading-relaxed inline-flex items-start gap-1">
+          Enter your name exactly as shown on your ID. It can&apos;t be edited after verification.
+          <span title="Your name is matched against the ID card you verify from your Profile page before your first exam. Once that match succeeds, your name and email are locked and an administrator would need to change them." className="cursor-help text-muted/70 shrink-0 mt-0.5">
+            <Icon name="alert" width={12} height={12} />
+          </span>
+        </p>
+        <TextField
+          id="email"
+          label="Email"
+          icon="mail"
+          type="email"
+          autoComplete="email"
+          placeholder="you@example.com"
+          value={form.email}
+          onChange={update("email")}
+          onBlur={handleBlur("email")}
+          error={touched.email ? errors.email : undefined}
+          valid={touched.email && !errors.email && form.email.trim() !== ""}
+          maxLength={150}
+          // Locked while a code is outstanding: the code belongs to this
+          // address, and editing the field would leave the candidate
+          // submitting the old address's code against a new one.
+          disabled={codeSent}
+        />
+        <TextField
+          id="studentId"
+          label={
+            <>
+              Student or candidate ID <span className="font-normal text-muted">· Optional</span>
+            </>
+          }
+          icon="hash"
+          autoComplete="off"
+          placeholder="e.g. 21CS042"
+          value={form.studentId}
+          onChange={update("studentId")}
+        />
+        <PasswordField
+          id="password"
+          label="Password"
+          autoComplete="new-password"
+          value={form.password}
+          onChange={update("password")}
+          onBlur={handleBlur("password")}
+          error={touched.password ? errors.password : undefined}
+          showStrength
+          // The rules as the SERVER states them, fetched from /auth/password-policy.
+          hint={policy?.rules?.join(" · ")}
+        />
+        <PasswordField
+          id="confirmPassword"
+          label="Confirm password"
+          autoComplete="new-password"
+          value={form.confirmPassword}
+          onChange={update("confirmPassword")}
+          onBlur={handleBlur("confirmPassword")}
+          error={touched.confirmPassword ? errors.confirmPassword : undefined}
+        />
+
+        {/* Required consent -- the second checkbox specifically, since this
+            platform collects face, ID, and webcam data during exams, which
+            is meaningfully different from an ordinary signup and deserves
+            its own explicit line rather than being folded into "I agree to
+            the Terms." See Privacy.jsx for exactly what's collected. */}
+        <div className="flex flex-col gap-2.5 mb-6 mt-2">
+          <label className="flex items-start gap-2.5 text-sm text-ink cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={form.agreeTerms}
+              onChange={(e) => setForm((f) => ({ ...f, agreeTerms: e.target.checked }))}
+              className="mt-0.5 w-4 h-4 rounded border-border text-primary focus:ring-primary/30 focus:ring-offset-0 shrink-0"
+            />
+            <span>
+              I agree to the{" "}
+              <Link to="/terms" target="_blank" className="font-semibold text-primary hover:underline">
+                Terms of Service
+              </Link>{" "}
+              and the{" "}
+              <Link to="/privacy" target="_blank" className="font-semibold text-primary hover:underline">
+                Privacy Policy
+              </Link>
+              .
+            </span>
+          </label>
+          <label className="flex items-start gap-2.5 text-sm text-ink cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={form.agreeProctoring}
+              onChange={(e) => setForm((f) => ({ ...f, agreeProctoring: e.target.checked }))}
+              className="mt-0.5 w-4 h-4 rounded border-border text-primary focus:ring-primary/30 focus:ring-offset-0 shrink-0"
+            />
+            <span>
+              I understand that identity and proctoring data may be collected during exams.{" "}
+              <Link to="/privacy" target="_blank" className="text-primary hover:underline">
+                See what&apos;s collected
+              </Link>
+              .
+            </span>
+          </label>
+        </div>
+
+        {codeSent && (
+          <div className="rounded-xl border border-primary/25 bg-primary/5 px-4 py-4 mb-5">
+            <div className="flex items-start gap-2.5 mb-3">
+              <span className="text-primary mt-0.5 shrink-0"><Icon name="mail" width={16} height={16} /></span>
+              <p className="text-sm text-ink leading-relaxed">
+                We&apos;ve sent a {codeShape.length}-digit code to <strong>{form.email.trim()}</strong>.
+                It expires in {codeShape.expiresIn} minutes.
+              </p>
+            </div>
+            <TextField
+              id="signup-code"
+              label="Verification code"
+              icon="shield"
+              value={code}
+              // Strip non-digits as they are typed and cap at the server's own length.
+              onChange={(e) => {
+                setCode(e.target.value.replace(/\D/g, "").slice(0, codeShape.length));
+                if (errors.code) setErrors((prev) => ({ ...prev, code: undefined }));
+              }}
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={codeShape.length}
+              autoComplete="one-time-code"
+              autoFocus
+              placeholder={"0".repeat(codeShape.length)}
+              error={touched.code ? errors.code : undefined}
+              className="mb-0"
+            />
+            <div className="flex items-center justify-between gap-3 mt-3">
+              <button type="button" onClick={resendCode} disabled={cooldown > 0}
+                      className="text-xs font-semibold text-primary disabled:text-muted disabled:cursor-not-allowed">
+                {cooldown > 0 ? `Resend in ${cooldown}s` : "Resend code"}
+              </button>
+              <button type="button" onClick={changeEmail}
+                      className="text-xs font-semibold text-muted hover:text-ink">
+                Change email
+              </button>
+            </div>
+          </div>
+        )}
+
+        <button
+          type="submit"
+          disabled={loading}
+          className={`${btnPrimary.replace("px-5 py-3", "px-5 py-4")} w-full group ${loading ? "opacity-70 pointer-events-none" : ""}`}
+        >
+          {loading && <Icon name="spinner" width={16} height={16} className="animate-spin" />}
+          {loading
+            ? (codeSent ? "Creating account…" : "Sending code…")
+            : (
+              <>
+                {codeSent ? "Verify & create account" : "Continue"}
+                <Icon name="arrow" width={16} height={16} className="transition-transform duration-200 group-hover:translate-x-1" />
+              </>
+            )}
+        </button>
+      </form>
+    </AuthLayout>
+  );
+}
+

@@ -1,0 +1,96 @@
+# Python virtual environments
+.venv/
+venv/
+backend/venv/
+backend/.runvenv/
+
+# Python cache and build output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Downloaded AI model weights (ArcFace/buffalo_*, YOLO). Hundreds of MB and reproducible.
+# Anchored with a leading slash so it never matches backend/app/models/, the ORM package.
+/backend/models/
+*.onnx
+*.pt
+
+# Runtime uploads and generated files
+uploads/
+backend/uploads/
+backend/.mpl-cache/
+*.log
+*.pid
+
+# Local databases and data dumps
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.sql
+
+# Vendored third-party runtime assets -- generated, not authored. The WASM bundle is copied
+# out of node_modules by `npm run vendor:mediapipe`; the .task weights by `npm run fetch:model`.
+frontend/public/mediapipe/
+
+# Node/frontend dependencies and build output
+node_modules/
+dist/
+dist_check/
+build/
+.cache/
+.parcel-cache/
+.vite/
+# Vite writes a temp .mjs beside its config on every dev-server start and leaves it behind.
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Editor and patch backup files.
+*.bak
+*.orig
+*.rej
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Accidental duplicates from a download or drag-and-drop copy,
+# e.g. "report copy.pdf" or "notes (1).md".
+* copy*
+*[(]1[)]*
+
+# Private keys/certificates. Nothing in this repo is meant to ship one.
+*.pem
+*.key
+*.p12
+*.pfx
+!deploy/**/*.example.*
+
+# Docker/local volume artifacts
+postgres-data/
+pgdata/
+
+# Transfer/scratch directories
+_to_delete/
